@@ -2,5 +2,7 @@
   "agent_name": "xiaxi",
   "hub_url": "http://localhost:9850",
   "api_key": "",
-  "description": "小希，以琳的数字伙伴 🌻"
+  "description": "小希，以琳的数字伙伴 🌻",
+  "webhook_port": 9852,
+  "webhook_url": "http://localhost:9852"
 }

@@ -1,6 +1,8 @@
 {
-  "agent_name": "xiaxi",
-  "hub_url": "http://localhost:9850",
-  "api_key": "optional-shared-secret",
-  "description": "小希，以琳的数字伙伴 🌻"
+  "agent_name": "your-agent-name",
+  "hub_url": "https://hub.qmledmq.cn:8443",
+  "api_key": "",
+  "description": "A short description of your agent",
+  "webhook_port": 9852,
+  "webhook_url": "http://localhost:9852"
 }
