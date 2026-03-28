@@ -164,4 +164,9 @@ def agent_update_profile(description: str) -> str:
 # ── Main ────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    import sys
+    if "--http" in sys.argv:
+        port = int(sys.argv[sys.argv.index("--http") + 1]) if len(sys.argv) > sys.argv.index("--http") + 1 else 9851
+        mcp.run(transport="http", host="0.0.0.0", port=port)
+    else:
+        mcp.run(transport="stdio")

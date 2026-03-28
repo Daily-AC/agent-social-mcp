@@ -8,6 +8,7 @@ import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
@@ -39,6 +40,7 @@ def init_db():
                 name TEXT PRIMARY KEY,
                 description TEXT DEFAULT '',
                 capabilities TEXT DEFAULT '[]',
+                webhook_url TEXT DEFAULT '',
                 registered_at REAL NOT NULL,
                 last_seen REAL NOT NULL
             )
@@ -53,6 +55,25 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_receiver ON messages(receiver, timestamp)")
+
+
+def fire_webhook(receiver: str, sender: str, content: str):
+    """异步通知收件人有新消息（非阻塞）"""
+    def _do():
+        try:
+            with get_db() as conn:
+                row = conn.execute("SELECT webhook_url FROM agents WHERE name = ?", (receiver,)).fetchone()
+            if not row or not row["webhook_url"]:
+                return
+            httpx.post(
+                row["webhook_url"],
+                json={"sender": sender, "receiver": receiver, "content": content, "timestamp": time.time()},
+                timeout=5,
+                proxy=None,
+            )
+        except Exception:
+            pass  # webhook 失败不影响消息存储
+    threading.Thread(target=_do, daemon=True).start()
 
 
 def cleanup_old_messages():
@@ -102,6 +123,7 @@ class AgentRegister(BaseModel):
     name: str
     description: str = ""
     capabilities: list[str] = []
+    webhook_url: str = ""  # 收到消息时回调此 URL
 
 
 class Message(BaseModel):
@@ -126,13 +148,14 @@ def register_agent(agent: AgentRegister, x_api_key: Optional[str] = Header(None)
     now = time.time()
     with get_db() as conn:
         conn.execute(
-            """INSERT INTO agents (name, description, capabilities, registered_at, last_seen)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO agents (name, description, capabilities, webhook_url, registered_at, last_seen)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET
                  description=excluded.description,
                  capabilities=excluded.capabilities,
+                 webhook_url=excluded.webhook_url,
                  last_seen=excluded.last_seen""",
-            (agent.name, agent.description, json.dumps(agent.capabilities), now, now),
+            (agent.name, agent.description, json.dumps(agent.capabilities), agent.webhook_url, now, now),
         )
     return {"ok": True, "agent": agent.name}
 
@@ -148,6 +171,7 @@ def list_agents(x_api_key: Optional[str] = Header(None)):
             "name": r["name"],
             "description": r["description"],
             "capabilities": json.loads(r["capabilities"]),
+            "webhook_url": bool(r["webhook_url"]),  # 只暴露是否有 webhook，不暴露 URL
             "registered_at": r["registered_at"],
             "last_seen": r["last_seen"],
         }
@@ -189,6 +213,8 @@ def send_message(msg: Message, x_api_key: Optional[str] = Header(None)):
         )
         # Update sender last_seen
         conn.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (ts, msg.sender))
+    # 异步通知收件人
+    fire_webhook(msg.receiver, msg.sender, msg.content)
     return {"ok": True, "timestamp": ts}
 
 
@@ -235,6 +261,9 @@ def broadcast(msg: Broadcast, x_api_key: Optional[str] = Header(None)):
                 (msg.sender, a["name"], msg.content, ts),
             )
         conn.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (ts, msg.sender))
+    # 异步通知每个收件人
+    for a in agents:
+        fire_webhook(a["name"], msg.sender, msg.content)
     return {"ok": True, "sent_to": [a["name"] for a in agents], "timestamp": ts}
 
 
