@@ -55,9 +55,38 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_receiver ON messages(receiver, timestamp)")
+        # ── Group tables ──
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                creator TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                role TEXT DEFAULT 'member',
+                joined_at REAL NOT NULL,
+                PRIMARY KEY (group_id, agent_name)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp REAL NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_gmsg_group ON group_messages(group_id, timestamp)")
 
 
-def fire_webhook(receiver: str, sender: str, content: str):
+def fire_webhook(receiver: str, sender: str, content: str, group_id: str = "", group_name: str = ""):
     """异步通知收件人有新消息（非阻塞）"""
     def _do():
         try:
@@ -65,9 +94,13 @@ def fire_webhook(receiver: str, sender: str, content: str):
                 row = conn.execute("SELECT webhook_url FROM agents WHERE name = ?", (receiver,)).fetchone()
             if not row or not row["webhook_url"]:
                 return
+            payload = {"sender": sender, "receiver": receiver, "content": content, "timestamp": time.time()}
+            if group_id:
+                payload["group_id"] = group_id
+                payload["group_name"] = group_name
             httpx.post(
                 row["webhook_url"],
-                json={"sender": sender, "receiver": receiver, "content": content, "timestamp": time.time()},
+                json=payload,
                 timeout=5,
                 proxy=None,
             )
@@ -134,6 +167,22 @@ class Message(BaseModel):
 
 
 class Broadcast(BaseModel):
+    sender: str
+    content: str
+    timestamp: Optional[float] = None
+
+
+class GroupCreate(BaseModel):
+    name: str
+    description: str = ""
+    creator: str
+
+
+class GroupInvite(BaseModel):
+    agent_name: str
+
+
+class GroupMessage(BaseModel):
     sender: str
     content: str
     timestamp: Optional[float] = None
@@ -265,6 +314,170 @@ def broadcast(msg: Broadcast, x_api_key: Optional[str] = Header(None)):
     for a in agents:
         fire_webhook(a["name"], msg.sender, msg.content)
     return {"ok": True, "sent_to": [a["name"] for a in agents], "timestamp": ts}
+
+
+# ── Group Routes ────────────────────────────────────────
+
+@app.post("/api/groups")
+def create_group(group: GroupCreate, x_api_key: Optional[str] = Header(None)):
+    bound_name = check_auth(x_api_key)
+    if bound_name:
+        group.creator = bound_name
+    import uuid
+    group_id = uuid.uuid4().hex[:8]
+    now = time.time()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO groups (id, name, description, creator, created_at) VALUES (?, ?, ?, ?, ?)",
+            (group_id, group.name, group.description, group.creator, now),
+        )
+        conn.execute(
+            "INSERT INTO group_members (group_id, agent_name, role, joined_at) VALUES (?, ?, 'owner', ?)",
+            (group_id, group.creator, now),
+        )
+    return {"ok": True, "group_id": group_id, "name": group.name}
+
+
+@app.get("/api/groups")
+def list_groups(member: Optional[str] = Query(None), x_api_key: Optional[str] = Header(None)):
+    check_auth(x_api_key)
+    with get_db() as conn:
+        if member:
+            rows = conn.execute("""
+                SELECT g.*, gm.role FROM groups g
+                JOIN group_members gm ON g.id = gm.group_id
+                WHERE gm.agent_name = ?
+                ORDER BY g.created_at DESC
+            """, (member,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM groups ORDER BY created_at DESC").fetchall()
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "description": r["description"],
+            "creator": r["creator"],
+            "created_at": r["created_at"],
+            **({"role": r["role"]} if member else {}),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/groups/{group_id}")
+def get_group(group_id: str, x_api_key: Optional[str] = Header(None)):
+    check_auth(x_api_key)
+    with get_db() as conn:
+        g = conn.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
+        if not g:
+            raise HTTPException(status_code=404, detail=f"Group '{group_id}' not found")
+        members = conn.execute(
+            "SELECT agent_name, role, joined_at FROM group_members WHERE group_id = ?", (group_id,)
+        ).fetchall()
+    return {
+        "id": g["id"],
+        "name": g["name"],
+        "description": g["description"],
+        "creator": g["creator"],
+        "created_at": g["created_at"],
+        "members": [{"name": m["agent_name"], "role": m["role"], "joined_at": m["joined_at"]} for m in members],
+    }
+
+
+@app.post("/api/groups/{group_id}/members")
+def add_group_member(group_id: str, invite: GroupInvite, x_api_key: Optional[str] = Header(None)):
+    check_auth(x_api_key)
+    now = time.time()
+    with get_db() as conn:
+        g = conn.execute("SELECT id FROM groups WHERE id = ?", (group_id,)).fetchone()
+        if not g:
+            raise HTTPException(status_code=404, detail=f"Group '{group_id}' not found")
+        try:
+            conn.execute(
+                "INSERT INTO group_members (group_id, agent_name, role, joined_at) VALUES (?, ?, 'member', ?)",
+                (group_id, invite.agent_name, now),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail=f"'{invite.agent_name}' already in group")
+    return {"ok": True, "group_id": group_id, "agent": invite.agent_name}
+
+
+@app.delete("/api/groups/{group_id}/members/{agent_name}")
+def remove_group_member(group_id: str, agent_name: str, x_api_key: Optional[str] = Header(None)):
+    check_auth(x_api_key)
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM group_members WHERE group_id = ? AND agent_name = ?",
+            (group_id, agent_name),
+        )
+    return {"ok": True}
+
+
+@app.post("/api/groups/{group_id}/messages")
+def send_group_message(group_id: str, msg: GroupMessage, x_api_key: Optional[str] = Header(None)):
+    bound_name = check_auth(x_api_key)
+    if bound_name:
+        msg.sender = bound_name
+    if len(msg.content) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(status_code=413, detail=f"Message too long (max {MAX_MESSAGE_LENGTH} chars)")
+    ts = msg.timestamp or time.time()
+    with get_db() as conn:
+        g = conn.execute("SELECT id, name FROM groups WHERE id = ?", (group_id,)).fetchone()
+        if not g:
+            raise HTTPException(status_code=404, detail=f"Group '{group_id}' not found")
+        # 检查发送者是否是群成员
+        member = conn.execute(
+            "SELECT 1 FROM group_members WHERE group_id = ? AND agent_name = ?",
+            (group_id, msg.sender),
+        ).fetchone()
+        if not member:
+            raise HTTPException(status_code=403, detail=f"'{msg.sender}' is not a member of this group")
+        conn.execute(
+            "INSERT INTO group_messages (group_id, sender, content, timestamp) VALUES (?, ?, ?, ?)",
+            (group_id, msg.sender, msg.content, ts),
+        )
+        conn.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (ts, msg.sender))
+        # 获取所有成员（除发送者）
+        recipients = conn.execute(
+            "SELECT agent_name FROM group_members WHERE group_id = ? AND agent_name != ?",
+            (group_id, msg.sender),
+        ).fetchall()
+    # 异步通知每个群成员
+    group_name = g["name"]
+    for r in recipients:
+        fire_webhook(r["agent_name"], msg.sender, msg.content, group_id=group_id, group_name=group_name)
+    return {"ok": True, "group_id": group_id, "sent_to": [r["agent_name"] for r in recipients], "timestamp": ts}
+
+
+@app.get("/api/groups/{group_id}/messages")
+def get_group_messages(
+    group_id: str,
+    since: Optional[float] = Query(None),
+    limit: int = Query(50, le=200),
+    x_api_key: Optional[str] = Header(None),
+):
+    check_auth(x_api_key)
+    with get_db() as conn:
+        if since:
+            rows = conn.execute(
+                "SELECT * FROM group_messages WHERE group_id = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT ?",
+                (group_id, since, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM group_messages WHERE group_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (group_id, limit),
+            ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "group_id": r["group_id"],
+            "sender": r["sender"],
+            "content": r["content"],
+            "timestamp": r["timestamp"],
+        }
+        for r in rows
+    ]
 
 
 # ── Main ────────────────────────────────────────────────
